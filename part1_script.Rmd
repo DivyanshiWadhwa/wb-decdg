@@ -1,0 +1,479 @@
+---
+title: "World Bank DECDG Technical Assignment"
+author: "Divyanshi Wadhwa"
+date: "02/23/2018"
+output: 
+  rmarkdown::html_document:
+    theme: cosmo
+    highlight: textmate
+runtime: shiny
+---
+
+Access to sanitation facilities has become a priority for many governments and donors today. The United Nations Sustainable Development Goals have drawn attention to the issue and aim to achieve universal access to basic sanitation facilities by 2030. However, 2.4 billion people lack access to sanitation facilities today. In my analysis, I examine how access to sanitation facilities has changed over a span of 25 years by income groups.
+
+```{r eruptions, include = F}
+### Install packages ###
+#install.packages("")
+library(WDI)
+library(countrycode)
+library(ggplot2)
+library(readxl)
+library(XML)
+library(RCurl)
+library(dplyr)
+library(stringr)
+library(zoo)
+library(data.table)
+library(shiny)
+library(gdata)
+library(scales)
+library(knitr)
+library(kableExtra)
+library(stringr)
+library(prettydoc)
+
+## Importing historical income thresholds
+URL <- "http://databank.worldbank.org/data/download/site-content/OGHIST.xls"
+inc <- read.xls(URL, skip = 6)
+
+## Cleaning the imported data
+### Redefining column names and keeping relevant observations
+colnames(inc)[1] <- "type"
+inc2 <- inc[(inc$type == "Low income" | inc$type == "Lower middle income" | 
+               inc$type == "Upper middle income" | inc$type == "High income"),]
+
+### Dropping observations for years that have no data
+inc2 <- inc2[,colSums(is.na(inc2))<nrow(inc2)]
+inc3 <- inc2[!(is.na(inc2$type)),]
+
+### Defining rows names
+rownames(inc3) <- inc3$type
+
+### Transposing dataframe for easier data manipulation
+inc4 <- data.frame(t(inc3[,-c(1)]))
+
+### Cleaning transposed data
+colnames(inc4) <- rownames(inc3)
+inc4$year <- rownames(inc4)
+inc4$year <- as.numeric(gsub(c("X"), "", inc4$year))
+
+### Cleaning numeric variables
+inc5 <- as.data.frame(lapply(inc4, function(x) {gsub(c(","), "", x)}))
+
+inc5$Low.income <- as.numeric(gsub("<= ", "", inc5$Low.income))
+inc5$High.income <- as.numeric(gsub("> ", "", inc5$High.income))
+
+### Splitting middle income categories - two variables per category,
+### each including lower and upper limit for the categories
+inc5$lmic.low <- str_split_fixed(inc5$Lower.middle.income, "-", 2)[,1]
+inc5$lmic.high <- str_split_fixed(inc5$Lower.middle.income, "-", 2)[,2]
+inc5$umic.low <- str_split_fixed(inc5$Upper.middle.income, "-", 2)[,1]
+inc5$umic.high <- str_split_fixed(inc5$Upper.middle.income, "-", 2)[,2]
+inc5$Lower.middle.income <- inc5$Upper.middle.income <- NULL
+
+############################################################################
+### Importing sanitation and auxiliary data from WDI API
+sanit <- WDI(indicator = c('SH.STA.ACSN', 'SP.POP.TOTL', 'NY.GDP.PCAP.KD', 'NY.GNP.PCAP.CD'), 
+             start = 1960, end = 2018, extra = T)
+
+### Removing aggregates from the data
+sani <- sanit[!(sanit$income == "Aggregates"),]
+sani <- sani[!(is.na(sani$country)),]
+
+### Removing years which have missing values for sanitation 
+### facilities for all countries
+missdat <- sani %>% 
+  group_by(year) %>%
+  summarise(no_rows = length(country),
+            no_miss = sum(is.na(SH.STA.ACSN)))
+missyears <- missdat$year[missdat$no_rows == missdat$no_miss]
+sani$dup <- match(sani$year, missyears)
+sani <- sani[is.na(sani$dup),]
+
+### Merging historical income thresholds data
+san <- merge(sani, inc5, by = "year", all.x = T)
+san <- subset(san, select = -c(iso2c, region, capital, longitude, latitude,
+                               lending, dup))
+
+### Creating a list of countries which I'd like to draw attention to
+san$note <- ifelse(san$country == "India" |
+                     san$country == "China" |
+                     san$country == "South Africa" |
+                     san$country == "Uganda" |
+                     san$country == "Russian Federation" |
+                     san$country == "United States", san$country,'')
+
+### Reassigning vector type to variables
+san$country <- as.factor(san$country)
+san$NY.GDP.PCAP.KD <- as.numeric(san$NY.GDP.PCAP.KD)
+san$NY.GNP.PCAP.CD <- as.numeric(san$NY.GNP.PCAP.CD)
+san$Low.income <- as.numeric(san$Low.income)
+san$lmic.high <- as.numeric(san$lmic.high)
+san$lmic.low <- as.numeric(san$lmic.low)
+san$umic.high <- as.numeric(san$umic.high)
+san$umic.low <- as.numeric(san$umic.low)
+
+### Interpolating data (to avoid break in series)
+### No interpolation for trailing and leading missing values, 
+### because it would be a much stronger assumption. 
+san <- san %>%
+  group_by(country) %>%
+  mutate(sf <- na.approx(SH.STA.ACSN, na.rm=FALSE))
+
+### Note: Turns out, interpolation was not required. 
+### The sanitation variable only consists of trailing and leading
+### missing values. These were not replaced, because it seems too arbitrary.
+
+### Defining "alternate income groups" that change with time
+### Based on historical income group thresholds
+san$chinc <- NA
+san$chinc[san$NY.GNP.PCAP.CD < san$Low.income] <- "Low income"
+san$chinc[san$NY.GNP.PCAP.CD >= san$lmic.low & 
+            san$NY.GNP.PCAP.CD <= san$lmic.high] <- "Lower middle income"
+san$chinc[san$NY.GNP.PCAP.CD >= san$umic.low &
+            san$NY.GNP.PCAP.CD <= san$umic.high] <- "Upper middle income"
+
+# Defining OECD countries
+san$nonoecd <- str_sub(san$income,-7,-1)
+san$oecd <- NA
+san$oecd[san$nonoecd == "e: OECD"] <- 1 
+
+san$chinc[(san$NY.GNP.PCAP.CD > san$High.income) & is.na(san$oecd)] <- "High income: nonOECD"
+san$chinc[san$NY.GNP.PCAP.CD > san$High.income & san$oecd == 1] <- "High income: OECD"
+
+### As per the changing income groups, South sudan, which is otherwise
+### not classified belongs to low income category in the most recent year, 2015. 
+### So I assign South Sudan to the low income group in the 
+### official income grouping
+san$income[san$income == "Not classified" & 
+             san$country == "South Sudan"] <- "Low income"
+
+### Subsetting data to relevant variables
+san <- subset(san, select = c (SH.STA.ACSN, NY.GDP.PCAP.KD,
+                               SP.POP.TOTL, income, country, 
+                               year, chinc, note))
+
+### Dropping data with missing values
+san <- na.omit(san)
+
+### Creating weights for each country based on population by year
+san2 <- aggregate(SP.POP.TOTL ~ year, san, sum) ## population sum by year
+san3 <- c(table(san$year)) ## number of observations by year
+san3 <- data.frame(san3)
+san3$year <- rownames(san3)
+
+san4 <- merge(san2, san3, by = c("year"))
+colnames(san4)[2] <- "sumpop"
+
+san <- merge(san, san4, by = c("year"))
+
+san$wpop <- (san$san3*san$SP.POP.TOTL)/san$sumpop ## populatoin weights
+
+### Weighting the sanitation numbers by population for each income group
+### Using most recent income groups
+wagg <- san %>%
+  group_by(income, year) %>%
+  mutate(wSHinc = weighted.mean(x = SH.STA.ACSN, w = wpop, na.rm = T))
+
+### Using alternative (changing) income groups
+wagg2 <- san %>%
+  group_by(chinc, year) %>%
+  mutate(wSHch = weighted.mean(x = SH.STA.ACSN, w = wpop, na.rm = T))
+
+### Reassigning vector types to variables
+san$income <- as.character(san$income) ## to remove empty factors
+san$income <- as.factor(san$income)
+san$chinc <- as.factor(san$chinc)
+
+## Rearranging order for factors
+san$income <- factor(san$income, levels = c("Low income",
+                                            "Lower middle income",
+                                            "Upper middle income",
+                                            "High income: nonOECD",
+                                            "High income: OECD"))
+
+san$chinc <- factor(san$chinc, levels = c("Low income",
+                                          "Lower middle income",
+                                          "Upper middle income",
+                                          "High income: nonOECD",
+                                          "High income: OECD"))
+
+
+### Creating logged variable for GDP per capita
+san$lngdp <- log(san$NY.GDP.PCAP.KD)
+
+### Aggregating data by both types of income groups
+agg1 <-aggregate(wagg[, -c(5:8)], by=list(san$income, san$year), 
+                FUN=mean, na.rm=TRUE)
+agg2 <-aggregate(wagg2[, -c(5:8)], by=list(san$chinc, san$year), 
+                 FUN=mean, na.rm=TRUE)
+
+### Rounding off numbers
+agg1$wSHinc <- round(agg1$wSHinc, 2)
+agg2$wSHch <- round(agg2$wSHch, 2)
+
+### Merging the income group level data for both types
+agg <- merge(agg1, agg2, by = c("Group.1", "year"))
+
+### Calculating slopes of income group time trend
+# Storing values by group for 2015 and 1990
+aggslope <- agg %>%
+  group_by(Group.1) %>%
+    mutate(wSHinc[year == 2015],
+           wSHinc[year == 1990])
+
+# Calculating slope by group
+aggslope$`Slope: Solid lines` <- (aggslope$`wSHinc[year == 2015]` - aggslope$`wSHinc[year == 1990]`)/(2015-1990)
+
+# Creating matrix for slopes
+sld <-aggregate(aggslope[,"Slope: Solid lines"], by=list(aggslope$Group.1), FUN=mean, na.rm=TRUE)
+colnames(sld)[1] <- "Income group"
+
+### Weighted averages at the world level by year
+worldagg <- san %>%
+  group_by(year) %>%
+  mutate(wSH = weighted.mean(x = SH.STA.ACSN, w = wpop, na.rm = T))
+
+worldagg2 <-aggregate(worldagg[, -c(5:8)], by=list(san$year), 
+                FUN=mean, na.rm=TRUE)
+
+```
+  
+#### **Descriptive Statistics**
+Overall, access to sanitation facilities has improved from 1990 (the first year for which sanitation data is made available) to 2015 (the last year for which sanitation data is available). Access to sanitation facilities as a percentage of total population in the sample was `r round((worldagg2$wSH[worldagg2$year == 1990]),2)`% in 1990, and `r round((worldagg2$wSH[worldagg2$year == 2015]),2)`% in 2015, indicating an  improvement of `r round((worldagg2$wSH[worldagg2$year == 2015]) - (worldagg2$wSH[worldagg2$year == 1990]), 2)` percentage points or `r round(100*((worldagg2$wSH[worldagg2$year == 2015]) - (worldagg2$wSH[worldagg2$year == 1990]))/(worldagg2$wSH[worldagg2$year == 1990]),2)`% in 25 years.
+  
+#### **Approach**
+To demonstrate how access to sanitation facilities has improved in different income groups, I present a time trend chart. I assign income groups as provided by the World Development Indicators database. They assign the most recent classification, as per 2017, to all country-year observations in the data. For example, if India is a lower-middle income country in the most recent classification, even if it belonged to the low income group in 1990, this database would categorize India as a lower-middle income country from 1990 through 2015 to maintain consistency.
+
+I then aggregate countries by income group for each year. A simple aggregation of countries in each income group would give equal weight to each country. For example, India and Honduras, with a colossal difference in population would be treated equally within the lower middle income group. However, such an aggregation would be unrepresentative of the population per income group. For this reason, I employ a weighted average, where weights are assigned by each country’s total population and the weighted mean is calculated for each income group and year. In a weighted average, India (with a large population) would be assigned high weightage, whereas Honduras (with a small population) would be assigned low weightage.
+
+In 25 years, several countries have moved from one income group to another. To account for this, I also present dotted trend lines where I allow for countries to move between income groups. For example, in the solid trend lines, China has been categorized as an upper-middle income country from 1990 through 2015. In the dotted trend lines, China is part of the low income group trend line from 1990 through 1997, then is part of the lower-middle income group trend line from 1998 through 2009, and finally, is part of the upper-middle income group trend line from 2010 through 2015.
+
+```{r, include = FALSE}
+#####################################################################
+
+## Defining aesthetics for data visaulizations
+
+## Defining colors by income group
+cols1 <- c("Low income" = "#d95f02", "Lower middle income" = "#7570b3", 
+           "Upper middle income" = "#e7298a", "High income: nonOECD" = "#1b9e77",
+           "High income: OECD" = "#66a61e")
+
+## Defining ggplot2 theme
+theme3 <- theme_bw() + 
+  theme(plot.background = element_rect(fill ="white"), panel.background = element_rect(fill = "white")) +
+  theme(panel.border= element_blank()) +
+  theme(title = element_text(size = 18),
+        axis.title = element_text(colour="black", size = 14)) +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom", legend.direction="horizontal",
+        legend.text = element_text(size = 12)) +
+  theme(axis.line.x = element_line(colour="black", size = 1),
+        axis.line.y = element_blank(),
+        axis.text.x = element_text(colour="black", size = 10),
+        axis.text.y = element_text(colour = "black"),
+        axis.ticks.x = element_line(colour="black"),
+        axis.ticks.y = element_blank())
+
+############################################################################
+
+## R Shiny app
+ui <- fluidPage(
+  
+  titlePanel("Access to sanitation facilities over 25 years"),
+      
+      # Defining widgets
+      fluidRow(
+      # Select chart type
+        wellPanel(
+        div(style="display: inline-block;vertical-align:top; width: 300px;",
+            radioButtons(inputId = "t", 
+                        label = "Analysis type:",
+                        choices = c("Time trend" = "line", 
+                                    "Cross country comparisons" = "bub"), 
+                        selected = "line"))
+        )
+      ),
+    
+    # Output: Show charts
+    mainPanel("Hover over points for more information",
+      conditionalPanel(
+                  condition = "input.t == 'line'",
+                 plotOutput(outputId = "lineplot", 
+                            hover = hoverOpts("plot2_hover", 
+                                              delay = 100, 
+                                              clip = F, nullOutside = F)),
+                 uiOutput("hover2_info"),
+            tags$footer("Note: Dotted lines represent income group trends allowing for countries to move between groups")
+      ),
+      conditionalPanel(
+        condition = "input.t == 'bub'",
+             plotOutput(outputId = "scatterplot", 
+                        hover = hoverOpts("plot_hover", 
+                                          delay = 100, delayType = "debounce", 
+                                          clip = F, nullOutside = F)),
+             uiOutput("hover_info"),
+      div(style="display: inline-block;vertical-align:top; width: 600px;",  
+          # Show slider for country-year chart
+          sliderInput(inputId = "year", 
+                      label = "Year:", 
+                      min = 1990, max = 2015, sep = "", 
+                      value = 1990, animate = animationOptions(interval = 1000))),
+      tags$script("$(document).ready(function(){
+                  setTimeout(function() {$('.slider-animate-button').click()},400);
+                  });")
+      ), 
+      width = 10)
+)
+
+# Define server function required to create the scatterplot and lineplot
+server <- function(input, output) {
+  
+  # Create reactive data for scatterplot
+  h <- reactive({
+    a <- subset(san, san$year == input$year)
+  })
+  
+  # Scatterplot
+  output$scatterplot <- renderPlot({
+    
+    ggplot(h(), aes(col = chinc, alpha = 0.7)) + 
+      geom_point(data = h(), 
+                 aes(x = lngdp, y = SH.STA.ACSN, size = SP.POP.TOTL)) +
+      geom_text(aes(x = lngdp, y = SH.STA.ACSN, label = note), hjust = -0.5) +
+      theme3 +
+      theme(axis.line.x = element_line(colour="black", size = 1)) +
+      scale_y_continuous(limits = c(0,100)) +
+      scale_x_continuous(limits = c(4, 12),
+                         breaks=c(6,8, 10), 
+                         labels=c(round(exp(6),2), round(exp(8),2), 
+                                  round(exp(10),2))) +
+      scale_colour_manual(values = cols1) +
+      labs(title = "",
+           subtitle = "",
+           x="GDP per capita (logged, USD 2010)",
+           y="Access to sanitation facilities (% of population)") +
+      guides(color=guide_legend(nrow=3,byrow=TRUE),
+             size=guide_legend(nrow=2,byrow=TRUE),
+             alpha = guide_legend("none")) +
+      scale_size_area(max_size = 12, 
+                      breaks = c(100000, 10000000, 500000000,
+                                 1000000000),
+                      labels = comma) 
+  })
+  
+  # Creating hover tooltip functionality
+  output$hover_info <- renderUI({
+    
+    hover <- input$plot_hover
+    point <- nearPoints(h(), hover, threshold = 5, maxpoints = 1, addDist = TRUE)
+    if (nrow(point) == 0) return(NULL)
+    
+    # calculate point position INSIDE the image as percent of total dimensions
+    # from left (horizontal) and from top (vertical)
+    left_pct <- (hover$x - hover$domain$left) / (hover$domain$right - hover$domain$left)
+    top_pct <- (hover$domain$top - hover$y) / (hover$domain$top - hover$domain$bottom)
+    
+    # calculate distance from left and bottom side of the picture in pixels
+    left_px <- hover$range$left + left_pct * (hover$range$right - hover$range$left)
+    top_px <- hover$range$top + top_pct * (hover$range$bottom - hover$range$top)
+    
+    # create style property for tooltip
+    # background color is set so tooltip is a bit transparent
+    # z-index is set so we are sure our tooltip will be on top
+    style <- paste0("position:absolute; z-index:100; background-color: rgba(245, 245, 245, 0.85); ",
+                    "left:", left_px + 2, "px; top:", top_px + 2, "px;")
+    
+    # actual tooltip created as wellPanel
+    wellPanel(
+      style = style,
+      p(HTML(paste0("<b> Country: </b>", point$country, "<br/>",
+                    "<b> year: </b>", point$year, "<br/>",
+                    "<b> Access to sanitation: </b>", point$SH.STA.ACSN, "<b>%", "<br/>",
+                    "<b> Income group: </b>", point$income)))
+      
+    )
+  })
+  
+  # Create lineplot
+  output$lineplot <- renderPlot({
+    
+    ggplot(agg, aes(x = year, group = agg$Group.1)) + 
+      geom_line(aes(y = wSHinc, col = agg$Group.1), size = 0.75) +
+      geom_line(aes(y = wSHch, col = agg$Group.1), size = 0.75, linetype = "dotted") +
+      geom_point(aes(y = wSHinc, col = agg$Group.1), size = 1) +
+      theme3 +
+      scale_y_continuous(limits = c(0,100)) +    
+      scale_colour_manual(values = cols1) +
+      labs(title = "",
+           subtitle = "",
+           x="",
+           y="Access to sanitation facilities (% of population)") +
+      theme(legend.position = "bottom", legend.direction="horizontal") +
+      theme(axis.line.x = element_line(colour="black", size = 1))  +
+      guides(color=guide_legend(nrow=2,byrow=TRUE))
+      
+  })
+  
+  # Create hover tooltip functionality
+  output$hover2_info <- renderUI({
+    
+    hover <- input$plot2_hover
+    point2 <- nearPoints(agg, hover, threshold = 5, maxpoints = 1, addDist = TRUE)
+    if (nrow(point2) == 0) return(NULL)
+    
+    # calculate point position INSIDE the image as percent of total dimensions
+    # from left (horizontal) and from top (vertical)
+    left_pct <- (hover$x - hover$domain$left) / (hover$domain$right - hover$domain$left)
+    top_pct <- (hover$domain$top - hover$y) / (hover$domain$top - hover$domain$bottom)
+    
+    # calculate distance from left and bottom side of the picture in pixels
+    left_px <- hover$range$left + left_pct * (hover$range$right - hover$range$left)
+    top_px <- hover$range$top + top_pct * (hover$range$bottom - hover$range$top)
+    
+    # create style property for tooltip
+    # background color is set so tooltip is a bit transparent
+    # z-index is set so we are sure our tooltip will be on top
+    style <- paste0("position:absolute; z-index:100; background-color: rgba(245, 245, 245, 0.85); ",
+                    "left:", left_px + 2, "px; top:", top_px + 2, "px;")
+    
+    # actual tooltip created as wellPanel
+    wellPanel(
+      style = style,
+      p(HTML(paste0("<b> Income group: </b>", point2$Group.1, "<br/>",
+                    "<b> year: </b>", point2$year, "<br/>",
+                    "<b> Access to sanitation: </b>", point2$wSHinc, "<b>%")))
+      
+    )
+  })
+}
+```
+
+```{r, echo = F}
+# Create a Shiny app object
+shinyApp(ui = ui, server = server, options = list(width=900, height=750))
+```
+  
+#### **Findings**
+It is unsurprising that throughout the given time period, the level of access to sanitation facilities is highly correlated with the income group. 
+
+* High income groups have nearly universal access to sanitation facilities; low income countries have the lowest, and middle income countries have intermediate level of access.
+
+* High income OECD countries did not have any room for improvement and therefore, roughly exhibit a constant level of access.
+
+* The most striking finding is that all other income groups exhibit a linear, upward time trend. Over time, access to sanitation facilities has improved at a roughly constant rate for each income group.
+
+* There is, however, a difference in rate of improvement in access to sanitation facilities by income groups. While low income countries had maximum scope for improvement in 1990, the rate of improvement for low income countries was slower than for lower middle- and upper middle- income countries.
+
+```{r, echo = FALSE}
+kable(sld, "html") %>%
+  kable_styling(full_width = F)
+```
+
+There could be several reasons for varying rates of improvement among the low and middle income groups. I examine one such speculation in this analysis. The difference in the rate of improvement among income groups could be a function of keeping the set of countries within each income group constant. Perhaps, countries that had slower economic growth also had slower rate of improvement in access to sanitation facilities. The dotted line for low income countries, which allows for countries to move between income groups, illustrates this point. This dotted trend line, which includes countries that graduated to middle income groups in later years such as, India and China, starts at a higher level and is steeper than the solid low income group trend line. However, it drops dramatically in 1998 possibly due to a large country (such as China) moving from the low income group to the lower middle income group.
+
+* This again signals, however only weakly, that economic growth (as measured by GNI per capita) could be highly correlated with increasing access to sanitation facilities.
+
+#### **Scope for further analysis**
+I also present a scatterplot to explore how access to sanitation facilities has changed relative to economic growth in each country over time (see cross country comparisons). The size of each point corresponds to a country’s total population in that year. I also identify some countries to illustrate the diagonal upward movement (i.e. increase in GDP correlates with increase in access to sanitation) over time.
+
